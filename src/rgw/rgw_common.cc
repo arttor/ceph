@@ -729,6 +729,33 @@ int parse_time(const char *time_str, real_time *time)
   return 0;
 }
 
+int parse_rgwx_mtime(const DoutPrefixProvider *dpp, const string& s, real_time *rt)
+{
+  // "<secs>[.<fraction>]", where fraction has up to 9 decimal digits
+  string err;
+  const auto dot = s.find('.');
+  long secs = strict_strtol(s.substr(0, dot).c_str(), 10, &err);
+  long nsecs = 0;
+
+  if (err.empty() && dot != string::npos) {
+    string frac = s.substr(dot + 1);
+    if (frac.empty() || frac.size() > 9 || frac.find('.') != string::npos) {
+      err = "invalid fraction";
+    } else {
+      frac.append(9 - frac.size(), '0');
+      nsecs = strict_strtol(frac.c_str(), 10, &err);
+    }
+  }
+  if (!err.empty() || secs < 0 || nsecs < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed converting mtime (" << s << ") to real_time" << dendl;
+    return -EINVAL;
+  }
+
+  *rt = utime_t(secs, nsecs).to_real_time();
+
+  return 0;
+}
+
 #define TIME_BUF_SIZE 128
 
 void rgw_to_iso8601(const real_time& t, char *dest, int buf_size)
