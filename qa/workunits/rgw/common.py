@@ -28,9 +28,10 @@ def exec_cmd(cmd, wait = True, **kwargs):
         return (out, proc.returncode)
     return ''
     
-def create_user(uid, display_name, access_key, secret_key):
-    _, ret = exec_cmd(f'radosgw-admin user create --uid {uid} --display-name "{display_name}" --access-key {access_key} --secret {secret_key}', check_retcode=False)
-    assert(ret == 0 or errno.EEXIST)
+def create_user(uid, display_name, access_key, secret_key, system=False):
+    system_flag = ' --system' if system else ''
+    _, ret = exec_cmd(f'radosgw-admin user create --uid {uid} --display-name "{display_name}" --access-key {access_key} --secret {secret_key}{system_flag}', check_retcode=False)
+    assert ret in (0, errno.EEXIST)
     
 def boto_connect(access_key, secret_key, config=None):
     def try_connect(portnum, ssl, proto):
