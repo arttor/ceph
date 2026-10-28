@@ -1083,6 +1083,12 @@ int FilterObject::load_obj_state(const DoutPrefixProvider *dpp,
   return next->load_obj_state(dpp, y, follow_olh);
 }
 
+int FilterObject::update_olh(const DoutPrefixProvider* dpp, optional_yield y,
+                             uint32_t flags)
+{
+  return next->update_olh(dpp, y, flags);
+}
+
 int FilterObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs,
 				Attrs* delattrs, optional_yield y, uint32_t flags)
 {
@@ -1344,6 +1350,7 @@ int FilterMultipartUpload::complete(const DoutPrefixProvider *dpp,
             const char *if_match,
             const char *if_nomatch)
 {
+  next->set_mtime = set_mtime;
   return next->complete(dpp, y, cct, part_etags, remove_objs, accounted_size,
 			compressed, cs_info, ofs, tag, owner, olh_epoch,
 			nextObject(target_obj), processed_prefixes);

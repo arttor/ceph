@@ -19,6 +19,7 @@
 
 #include "include/stringify.h"
 #include "include/str_list.h"
+#include "include/variant_print.h"
 #include "auth/RotatingKeyRing.h"
 #include "json_spirit/json_spirit_writer.h"
 
@@ -44,6 +45,7 @@
 #include "messages/MPGStats.h"
 #include "messages/MOSDScrub2.h"
 #include "messages/MOSDForceRecovery.h"
+#include "common/debug.h"
 #include "common/errno.h"
 #include "common/JSONFormatter.h"
 #include "common/pick_address.h"
@@ -102,11 +104,11 @@ DaemonServer::DaemonServer(MonClient *monc_,
 				     g_conf().get_val<uint64_t>("mgr_osd_messages"))),
       mds_byte_throttler(new Throttle(g_ceph_context, "mgr_mds_bytes",
 				      g_conf().get_val<Option::size_t>("mgr_mds_bytes"))),
-      mds_msg_throttler(new Throttle(g_ceph_context, "mgr_mds_messsages",
+      mds_msg_throttler(new Throttle(g_ceph_context, "mgr_mds_messages",
 				     g_conf().get_val<uint64_t>("mgr_mds_messages"))),
       mon_byte_throttler(new Throttle(g_ceph_context, "mgr_mon_bytes",
 				      g_conf().get_val<Option::size_t>("mgr_mon_bytes"))),
-      mon_msg_throttler(new Throttle(g_ceph_context, "mgr_mon_messsages",
+      mon_msg_throttler(new Throttle(g_ceph_context, "mgr_mon_messages",
 				     g_conf().get_val<uint64_t>("mgr_mon_messages"))),
       msgr(nullptr),
       monc(monc_),
@@ -139,24 +141,6 @@ DaemonServer::DaemonServer(MonClient *monc_,
                                                     cct->_conf->mgr_op_history_slow_op_threshold);
 }
 
-void DaemonServer::shutdown()
-{
-  bool expected = false;
-  if (!shutting_down.compare_exchange_strong(expected, true)) {
-    return;
-  }
-
-  op_tracker.on_shutdown();
-
-  delete msgr;
-  msgr = nullptr;
-  g_conf().remove_observer(this);
-}
-
-DaemonServer::~DaemonServer() {
-  shutdown();
-}
-
 class DaemonServerHook : public AdminSocketHook {
   DaemonServer *daemon_server;
 public:
@@ -179,6 +163,43 @@ public:
     return r;
   }
 };
+
+void DaemonServer::shutdown()
+{
+  bool expected = false;
+  if (!shutting_down.compare_exchange_strong(expected, true)) {
+    return;
+  }
+
+  op_tracker.on_shutdown();
+
+  {
+    std::lock_guard l(lock);
+    timer.shutdown();
+  }
+
+  if (asok_hook) {
+    AdminSocket *admin_socket = g_ceph_context->get_admin_socket();
+    admin_socket->unregister_commands(asok_hook);
+    delete asok_hook;
+    asok_hook = nullptr;
+  }
+
+  if (msgr) {
+    msgr->shutdown();
+    msgr->wait();
+    delete msgr;
+    msgr = nullptr;
+  }
+
+  monc->set_handle_authentication_dispatcher(nullptr);
+
+  g_conf().remove_observer(this);
+}
+
+DaemonServer::~DaemonServer() {
+  shutdown();
+}
 
 int DaemonServer::init(uint64_t gid, entity_addrvec_t client_addrs)
 {
@@ -2612,7 +2633,11 @@ bool DaemonServer::_handle_command(
       auto rgw_daemons = daemon_state.get_by_service("rgw");
       for (auto& rgw_daemon : rgw_daemons) {
 	DaemonStatePtr daemon = rgw_daemon.second;
-	string name = daemon->metadata.find("id")->second;
+	string name;
+	{
+	  std::lock_guard l(daemon->lock);
+	  name = daemon->metadata.find("id")->second;
+	}
 	/*
 	 * The id stored in the metadata is the port number
 	 * for the RGW daemon.
