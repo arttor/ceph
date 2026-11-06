@@ -21,6 +21,7 @@
 #include <boost/algorithm/string.hpp>
 #include <experimental/iterator>
 #include <locale>
+#include <iomanip>  // for std::quoted
 #include <sstream>
 
 #include "mon/OSDMonitor.h"
@@ -90,10 +91,14 @@
 #include "include/str_list.h"
 #include "include/str_map.h"
 #include "include/scope_guard.h"
+#include "include/variant_print.h"
 #include "perfglue/heap_profiler.h"
 
 #include "auth/cephx/CephxKeyServer.h"
 #include "osd/OSDCap.h"
+#include "osd/BloomHitSet.h"
+#include "osd/ExplicitHashHitSet.h"
+#include "osd/ExplicitObjectHitSet.h"
 
 #include "json_spirit/json_spirit_reader.h"
 
@@ -690,16 +695,16 @@ void OSDMonitor::create_initial()
   if (newmap.nearfull_ratio > 1.0) newmap.nearfull_ratio /= 100;
 
   // new cluster should require latest by default
-  if (g_conf().get_val<bool>("mon_debug_no_require_umbrella")) {
-    if (g_conf().get_val<bool>("mon_debug_no_require_tentacle")) {
-      derr << __func__ << " mon_debug_no_require_umbrella and tentacle=true" << dendl;
-      newmap.require_osd_release = ceph_release_t::squid;
-    } else {
-      derr << __func__ << " mon_debug_no_require_umbrella=true" << dendl;
+  if (g_conf().get_val<bool>("mon_debug_no_require_vampire")) {
+    if (g_conf().get_val<bool>("mon_debug_no_require_umbrella")) {
+      derr << __func__ << " mon_debug_no_require_vampire and umbrella=true" << dendl;
       newmap.require_osd_release = ceph_release_t::tentacle;
+    } else {
+      derr << __func__ << " mon_debug_no_require_vampire=true" << dendl;
+      newmap.require_osd_release = ceph_release_t::umbrella;
     }
   } else {
-    newmap.require_osd_release = ceph_release_t::umbrella;
+    newmap.require_osd_release = ceph_release_t::vampire;
   }
 
   ceph_release_t r = ceph_release_from_name(g_conf()->mon_osd_initial_require_min_compat_client);
@@ -2081,6 +2086,9 @@ void OSDMonitor::encode_pending(MonitorDBStore::TransactionRef t)
   ceph_assert(get_last_committed() + 1 == pending_inc.epoch);
   bufferlist bl;
   encode(pending_inc, bl, features | CEPH_FEATURE_RESERVED);
+
+  dout(1) << "encode_pending e" << pending_inc.epoch
+          << " inc " << bl.length() << " bytes" << dendl;
 
   dout(20) << __func__ << " mon is running version: "
     << ceph_version_to_str() << dendl;
@@ -3552,26 +3560,26 @@ bool OSDMonitor::preprocess_boot(MonOpRequestRef op)
   ceph_assert(m->get_orig_source_inst().name.is_osd());
 
   // lower bound of N-2
-  if (!HAVE_FEATURE(m->osd_features, SERVER_SQUID)) {
+  if (!HAVE_FEATURE(m->osd_features, SERVER_TENTACLE)) {
     mon.clog->info() << "disallowing boot of OSD "
 		     << m->get_orig_source_inst()
-		     << " because the osd lacks CEPH_FEATURE_SERVER_SQUID";
+		     << " because the osd lacks CEPH_FEATURE_SERVER_TENTACLE";
     goto ignore;
   }
 
   // make sure osd versions do not span more than 3 releases
-  if (HAVE_FEATURE(m->osd_features, SERVER_TENTACLE) &&
-      osdmap.require_osd_release < ceph_release_t::reef) {
-    mon.clog->info() << "disallowing boot of tentacle+ OSD "
-		      << m->get_orig_source_inst()
-		      << " because require_osd_release < reef";
-    goto ignore;
-  }
   if (HAVE_FEATURE(m->osd_features, SERVER_UMBRELLA) &&
     osdmap.require_osd_release < ceph_release_t::squid) {
     mon.clog->info() << "disallowing boot of umbrella+ OSD "
                       << m->get_orig_source_inst()
                       << " because require_osd_release < squid";
+    goto ignore;
+  }
+  if (HAVE_FEATURE(m->osd_features, SERVER_VAMPIRE) &&
+    osdmap.require_osd_release < ceph_release_t::tentacle) {
+    mon.clog->info() << "disallowing boot of vampire+ OSD "
+                      << m->get_orig_source_inst()
+                      << " because require_osd_release < tentacle";
     goto ignore;
   }
 
@@ -5887,6 +5895,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
       f->dump_string("host", p->second);
     }
     for (auto& k : {
+	"devices",                   // set by get_device_metadata()
 	"pod_name", "pod_namespace", // set by rook
 	"container_name"             // set by cephadm, ceph-ansible
 	}) {
@@ -6162,20 +6171,24 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
     }
     rdata.append(ds);
   } else if (prefix == "osd blocklist ls" ||
-	     prefix == "osd blacklist ls") {
-    if (f)
+             prefix == "osd blacklist ls") {
+    bool new_format = op->get_connection()->has_features(CEPH_FEATUREMASK_SERVER_UMBRELLA);
+    if (f) {
+      if (new_format) {
+        f->open_object_section("blocklist_info");
+      }
       f->open_array_section("blocklist");
-
-    for (auto p = osdmap.blocklist.begin(); p != osdmap.blocklist.end(); ++p) {
+    }
+    for (auto & p : osdmap.blocklist) {
       if (f) {
 	f->open_object_section("entry");
-	f->dump_string("addr", p->first.get_legacy_str());
-	f->dump_stream("until") << p->second;
+	f->dump_string("addr", p.first.get_legacy_str());
+	f->dump_stream("until") << p.second;
 	f->close_section();
       } else {
 	stringstream ss;
 	string s;
-	ss << p->first << " " << p->second;
+	ss << p.first << " " << p.second;
 	getline(ss, s);
 	s += "\n";
 	rdata.append(s);
@@ -6183,40 +6196,49 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
     }
     if (f) {
       f->close_section();
-      f->flush(rdata);
+      if (!new_format) {
+        f->flush(rdata);
+      }
     }
     if (f)
       f->open_array_section("range_blocklist");
 
-    for (auto p = osdmap.range_blocklist.begin();
-	 p != osdmap.range_blocklist.end();
-	 ++p) {
+    for (auto & p : osdmap.range_blocklist) {
       if (f) {
-	f->open_object_section("entry");
-	f->dump_string("range", p->first.get_legacy_str());
-	f->dump_stream("until") << p->second;
-	f->close_section();
+        f->open_object_section("entry");
+        f->dump_string("range", p.first.get_legacy_str());
+        f->dump_stream("until") << p.second;
+        f->close_section();
       } else {
-	stringstream ss;
-	string s;
-	ss << p->first << " " << p->second;
-	getline(ss, s);
-	s += "\n";
-	rdata.append(s);
+        stringstream ss;
+        string s;
+        ss << p.first << " " << p.second;
+        getline(ss, s);
+        s += "\n";
+        rdata.append(s);
       }
     }
     if (f) {
       f->close_section();
-      f->flush(rdata);
+      if (new_format) {
+        f->close_section();
+        f->flush(ds);
+        rdata.append(ds);
+      } else {
+        f->flush(rdata);
+      }
     }
-    ss << "listed " << osdmap.blocklist.size() + osdmap.range_blocklist.size() << " entries";
-
+    if (!new_format || !f) {
+      ss << "listed " << osdmap.blocklist.size() + osdmap.range_blocklist.size() << " entries";
+    }
   } else if (prefix == "osd pool ls") {
     string detail;
     cmd_getval(cmdmap, "detail", detail);
+    bool show_rule_names = false;
+    cmd_getval(cmdmap, "show_rule_names", show_rule_names);
     if (!f && detail == "detail") {
       ostringstream ss;
-      osdmap.print_pools(cct, ss);
+      osdmap.print_pools(cct, ss, show_rule_names);
       rdata.append(ss.str());
     } else {
       if (f)
@@ -6227,7 +6249,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
 	    f->open_object_section("pool");
 	    f->dump_int("pool_id", pid);
 	    f->dump_string("pool_name", osdmap.get_pool_name(pid));
-	    pdata.dump(f.get());
+	    pdata.dump(f.get(), osdmap.crush.get(), show_rule_names);
 	    osdmap.dump_read_balance_score(cct, pid, pdata, f.get());
 	    f->close_section();
 	  } else {
@@ -8428,6 +8450,15 @@ int OSDMonitor::prepare_new_pool(string& name,
   if (-1 == pending_inc.new_pool_max)
     pending_inc.new_pool_max = osdmap.pool_max;
   int64_t pool = ++pending_inc.new_pool_max;
+  // Roll back the new pool entry and ID if we return with an error after this
+  // point; dismissed once new_pool_names is set on the success path.
+  bool pool_committed = false;
+  auto abort_guard = make_scope_guard([&] {
+    if (!pool_committed) {
+      pending_inc.new_pools.erase(pool);
+      --pending_inc.new_pool_max;
+    }
+  });
   pg_pool_t empty;
   pg_pool_t *pi = pending_inc.get_new_pool(pool, &empty);
   pi->create_time = ceph_clock_now();
@@ -8468,12 +8499,10 @@ int OSDMonitor::prepare_new_pool(string& name,
     pi->peering_crush_mandatory_member = CRUSH_ITEM_NONE;
     if (osdmap.degraded_stretch_mode) {
       pi->peering_crush_bucket_count = osdmap.degraded_stretch_mode;
-      pi->peering_crush_bucket_target = osdmap.degraded_stretch_mode;
       // pi->peering_crush_bucket_mandatory_member = CRUSH_ITEM_NONE;
       // TODO: drat, we don't record this ^ anywhere, though given that it
       // necessarily won't exist elsewhere it likely doesn't matter
       pi->min_size = pi->min_size / 2;
-      pi->size = pi->size / 2; // only support 2 zones now
     }
   }
 
@@ -8550,7 +8579,7 @@ int OSDMonitor::prepare_new_pool(string& name,
   // For Crimson - only EC-optimized pools are supported.
   if (pi->is_erasure()) {
     if (crimson) {
-      if (auto r = enable_pool_ec_optimizations(*pi, true); !r) {
+      if (auto r = enable_pool_ec_optimizations(*pi, true, false); !r) {
         // for Crimson - failure is not an option
         *ss << r.error().message;
         return r.error().error;
@@ -8558,7 +8587,7 @@ int OSDMonitor::prepare_new_pool(string& name,
     } else {
       if (cct->_conf.get_val<bool>("osd_pool_default_flag_ec_optimizations")) {
         // Silently fail if the pool cannot support ec optimizations.
-        std::ignore = enable_pool_ec_optimizations(*pi, true);
+        std::ignore = enable_pool_ec_optimizations(*pi, true, false);
       }
     }
   }
@@ -8574,6 +8603,7 @@ int OSDMonitor::prepare_new_pool(string& name,
   }
 
   pending_inc.new_pool_names[pool] = name;
+  pool_committed = true;
   return 0;
 }
 
@@ -8604,7 +8634,8 @@ bool OSDMonitor::prepare_unset_flag(MonOpRequestRef op, int flag)
 }
 
 tl::expected<void, ErrorNMessage>
-OSDMonitor::enable_pool_ec_optimizations(pg_pool_t &p, bool enable)
+OSDMonitor::enable_pool_ec_optimizations(pg_pool_t &p, bool enable,
+                                         bool yes_i_really_mean_it)
 {
   if (!p.is_erasure()) {
     return tl::unexpected(ErrorNMessage{
@@ -8635,6 +8666,12 @@ OSDMonitor::enable_pool_ec_optimizations(pg_pool_t &p, bool enable)
       return tl::unexpected(ErrorNMessage{
 	  -EINVAL,
 	  "ec optimizations not currently supported for pool profile."});
+    } else if (!yes_i_really_mean_it && (erasure_code->get_supported_optimizations() &
+        ErasureCodeInterface::FLAG_EC_PLUGIN_OPTIMIZED_EXPERIMENTAL) != 0) {
+        return tl::unexpected(ErrorNMessage{
+	  -EINVAL,
+	  "This is experimental for use in test and development and is not a "
+                  "supported configuration."});
     }
 
     if ((chunk_size % 4096) != 0) {
@@ -9244,7 +9281,9 @@ int OSDMonitor::prepare_command_pool_set(const cmdmap_t& cmdmap,
       return -EINVAL;
     }
     bool was_enabled = p.allows_ecoptimizations();
-    if (auto r = enable_pool_ec_optimizations(p, enable); !r) {
+    bool force = false;
+    cmd_getval(cmdmap, "yes_i_really_mean_it", force);
+    if (auto r = enable_pool_ec_optimizations(p, enable, force); !r) {
       ss << r.error().message;
       return r.error().error;
     }
@@ -9584,9 +9623,25 @@ int OSDMonitor::prepare_command_pool_application(const string &prefix,
   return _command_pool_application(prefix, cmdmap, ss, nullptr, true);
 }
 
+static bool refuse_in_stretch_mode(const OSDMap& osdmap,
+                                   const string& command,
+                                   stringstream& ss)
+{
+  if (osdmap.stretch_mode_enabled) {
+    ss << command << " is for individual stretch pools and cannot be used "
+       << "while stretch mode is enabled";
+    return true;
+  }
+  return false;
+}
+
 int OSDMonitor::prepare_command_pool_stretch_set(const cmdmap_t& cmdmap,
                                                     stringstream& ss)
 {
+  if (refuse_in_stretch_mode(osdmap, "osd pool stretch set", ss)) {
+    return -EINVAL;
+  }
+
   string pool_name;
   cmd_getval(cmdmap, "pool", pool_name);
   int64_t pool = osdmap.lookup_pg_pool_name(pool_name);
@@ -9598,6 +9653,11 @@ int OSDMonitor::prepare_command_pool_stretch_set(const cmdmap_t& cmdmap,
   pg_pool_t p = *osdmap.get_pg_pool(pool);
   if (pending_inc.new_pools.count(pool))
     p = pending_inc.new_pools[pool];
+
+  if (p.is_erasure()) {
+    ss << "stretched pools must be replicated; '" << pool_name << "' is erasure-coded";
+    return -EINVAL;
+  }
 
   int64_t bucket_count = cmd_getval_or<int64_t>(cmdmap, "peering_crush_bucket_count", 0);
   if (bucket_count <= 0) {
@@ -9696,6 +9756,10 @@ int OSDMonitor::prepare_command_pool_stretch_unset(const cmdmap_t& cmdmap,
   * Command syntax:
   *   ceph osd pool stretch unset <pool>
   */
+  if (refuse_in_stretch_mode(osdmap, "osd pool stretch unset", ss)) {
+    return -EINVAL;
+  }
+
   string pool_name;
   cmd_getval(cmdmap, "pool", pool_name);
   int64_t pool = osdmap.lookup_pg_pool_name(pool_name);
@@ -9744,6 +9808,22 @@ int OSDMonitor::prepare_command_pool_stretch_unset(const cmdmap_t& cmdmap,
   if (pool_min_size < 0) {
     ss << "pool min_size must be non-negative";
     return -EINVAL;
+  }
+
+  // only an older mon could have stretched an EC pool; let unset repair it
+  if (p.is_erasure()) {
+    ErasureCodeInterfaceRef erasure_code;
+    int err = get_erasure_code(p.erasure_code_profile, &erasure_code, &ss);
+    if (err < 0) {
+      return err;
+    }
+    int64_t k = erasure_code->get_data_chunk_count();
+    int64_t k_plus_m = erasure_code->get_chunk_count();
+    if (pool_size != k_plus_m || pool_min_size < k || pool_min_size > k_plus_m) {
+      ss << "'" << pool_name << "' is erasure-coded: size must be " << k_plus_m
+         << " (k+m) and min_size between " << k << " (k) and " << k_plus_m;
+      return -EINVAL;
+    }
   }
 
   // unset stretch values
@@ -12468,7 +12548,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       err = 0;
       goto reply_no_propose;
     }
-    if (osdmap.require_osd_release < ceph_release_t::squid && !sure) {
+    if (osdmap.require_osd_release < ceph_release_t::tentacle && !sure) {
       ss << "Not advisable to continue since current 'require_osd_release' "
          << "refers to a very old Ceph release. Pass "
 	 << "--yes-i-really-mean-it if you really wish to continue.";
@@ -12517,6 +12597,19 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       if ((!HAVE_FEATURE(osdmap.get_up_osd_features(), SERVER_UMBRELLA))
            && !sure) {
         ss << "not all up OSDs have CEPH_FEATURE_SERVER_UMBRELLA feature";
+        err = -EPERM;
+        goto reply_no_propose;
+      }
+    } else if (rel == ceph_release_t::vampire) {
+      if (!mon.monmap->get_required_features().contains_all(
+            ceph::features::mon::FEATURE_VAMPIRE)) {
+        ss << "not all mons are vampire";
+        err = -EPERM;
+        goto reply_no_propose;
+      }
+      if ((!HAVE_FEATURE(osdmap.get_up_osd_features(), SERVER_VAMPIRE))
+           && !sure) {
+        ss << "not all up OSDs have CEPH_FEATURE_SERVER_VAMPIRE feature";
         err = -EPERM;
         goto reply_no_propose;
       }
@@ -14944,6 +15037,12 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       goto reply_no_propose;
     }
   } else if (prefix == "osd force_healthy_stretch_mode") {
+    if (!mon.is_degraded_stretch_mode() || !mon.is_recovering_stretch_mode()) {
+      ss << "the cluster is not in recovery stretch mode; "
+         << "force_healthy_stretch_mode only ends recovery stretch mode";
+      err = -EINVAL;
+      goto reply_no_propose;
+    }
     bool sure = false;
     cmd_getval(cmdmap, "yes_i_really_mean_it", sure);
     if (!sure) {
@@ -15947,7 +16046,7 @@ void OSDMonitor::try_enable_stretch_mode(stringstream& ss, bool *okay,
     ss << "the 2 " << dividing_bucket
        << "instances in the cluster have differing weights "
        << weight1 << " and " << weight2
-       << " but stretch mode currently" 
+       << " but stretch mode currently"
        <<" requires the difference to be no greater than "
        << stretch_max_weight_delta * 100 << "%";
     *errcode = -EINVAL;

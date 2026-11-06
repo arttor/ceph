@@ -28,7 +28,7 @@
 #include "common/compiler_extensions.h"
 #include "include/common_fwd.h"
 #include "include/cephfs/ceph_ll_client.h"
-#include "include/filepath.h"
+#include "common/filepath.h"
 #include "include/interval_set.h"
 #include "include/lru.h"
 #include "include/types.h"
@@ -85,6 +85,7 @@ class WritebackHandler;
 
 class MDSMap;
 class Message;
+class MQuarantineDisable;
 class destructive_lock_ref_t;
 
 enum {
@@ -859,6 +860,7 @@ public:
   void maybe_update_snaprealm(SnapRealm *realm, snapid_t snap_created, snapid_t snap_highwater,
 			      std::vector<snapid_t>& snaps);
 
+  void handle_quarantine_disable(const MConstRef<MQuarantineDisable>& m);
   void handle_quota(const MConstRef<MClientQuota>& m);
   void handle_snap(const MConstRef<MClientSnap>& m);
   void handle_caps(const MConstRef<MClientCaps>& m);
@@ -1314,6 +1316,7 @@ protected:
    */
   void _finish_init();
 
+
   // global client lock
   //  - protects Client and buffer cache both!
   ceph::mutex client_lock = ceph::make_mutex("Client::client_lock");
@@ -1336,6 +1339,7 @@ protected:
   Objecter  *objecter;
 
   client_t whoami;
+
 
   /* The state migration mechanism */
   enum _state {
@@ -2048,6 +2052,7 @@ private:
   /* Flags for VXattr */
   static const unsigned VXATTR_RSTAT = 0x1;
   static const unsigned VXATTR_DIRSTAT = 0x2;
+  static const unsigned VXATTR_ALTNAME = 0x4;
 
   static const VXattr _dir_vxattrs[];
   static const VXattr _file_vxattrs[];
@@ -2137,16 +2142,16 @@ private:
   int _getattr(const InodeRef& in, int mask, const UserPerm& perms, bool force=false);
   int _readlink(const InodeRef& diri, const char* relpath, char *buf, size_t size, const UserPerm& perms);
   int _getxattr(Inode *in, const char *name, void *value, size_t len,
-		const UserPerm& perms);
+		const UserPerm& perms, Dentry *dn=nullptr);
   int _getxattr(const InodeRef &in, const char *name, void *value, size_t len,
 		const UserPerm& perms);
   int _getvxattr(Inode *in, const UserPerm& perms, const char *attr_name,
                  ssize_t size, void *value, mds_rank_t rank);
   int _listxattr(Inode *in, char *names, size_t len, const UserPerm& perms);
   int _do_setxattr(Inode *in, const char *name, const void *value, size_t len,
-		   int flags, const UserPerm& perms);
+		   int flags, const UserPerm& perms, Dentry *dn=nullptr);
   int _setxattr(const InodeRef &in, const char *name, const void *value, size_t len,
-		int flags, const UserPerm& perms);
+		int flags, const UserPerm& perms, Dentry *dn=nullptr);
   int _setxattr_check_data_pool(std::string& name, std::string& value, const OSDMap *osdmap);
   void _setxattr_maybe_wait_for_osdmap(const char *name, const void *value, size_t len);
   int _removexattr(Inode *in, const char *nm, const UserPerm& perms);
@@ -2247,6 +2252,10 @@ private:
   bool _vxattrcb_mirror_info_exists(Inode *in);
   size_t _vxattrcb_mirror_info(Inode *in, char *val, size_t size);
 
+  int _set_alternate_name(Inode *in, const void *val, size_t size,
+			  const UserPerm& perms, Dentry *dn);
+  int _get_alternate_name(Inode *in, Dentry *dn, char *buf, int buflen);
+
   size_t _vxattrcb_cluster_fsid(Inode *in, char *val, size_t size);
   size_t _vxattrcb_client_id(Inode *in, char *val, size_t size);
 
@@ -2323,11 +2332,13 @@ private:
   std::unique_ptr<FSMap> fsmap;
   std::unique_ptr<FSMapUser> fsmap_user;
 
+protected:
   // This mutex only protects command_table
   ceph::mutex command_lock = ceph::make_mutex("Client::command_lock");
   // MDS command state
   CommandTable<MDSCommandOp> command_table;
 
+private:
   bool _use_faked_inos;
 
   // Cluster fsid
@@ -2421,10 +2432,12 @@ private:
 
   bool is_fuse = false;
   bool client_permissions;
+  bool alternate_name_visible;
   bool fuse_default_permissions;
   bool respect_subvolume_snapshot_visibility;
 
   std::locale m_locale;
+
 };
 
 /**

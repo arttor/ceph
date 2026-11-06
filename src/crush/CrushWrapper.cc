@@ -2431,7 +2431,19 @@ int CrushWrapper::add_multi_osd_per_failure_domain_rule_at(
       if (err)
 	*err << "unknown type " << failure_domain_name;
       return -EINVAL;
+    } else if (type == 0) {
+      if (err) {
+        *err << "cannot automatically create msr rule with leaf failure domain: "
+             << failure_domain_name;
+      }
+      return -EINVAL;
     }
+  } else {
+    if (err) {
+      *err << "cannot automatically create msr rule without "
+           << "failure domain specified";
+    }
+    return -EINVAL;
   }
   if (device_class.size()) {
     if (!class_exists(device_class)) {
@@ -2533,11 +2545,14 @@ void CrushWrapper::_normalize_weight_map(float sum,
 					 map<int,float> *pmap) const
 {
   for (auto& p : m) {
+    // When the total weight is zero all the weights in m are zero as well, so
+    // don't divide by it - that would yield inf / nan weights.
+    float w = (sum > 0) ? p.second / sum : 0.0f;
     map<int,float>::iterator q = pmap->find(p.first);
     if (q == pmap->end()) {
-      (*pmap)[p.first] = p.second / sum;
+      (*pmap)[p.first] = w;
     } else {
-      q->second += p.second / sum;
+      q->second += w;
     }
   }
 }

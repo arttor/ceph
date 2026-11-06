@@ -244,7 +244,10 @@ class CephfsConnectionPool(object):
             self.fs.conf_set("client_quota", "false")
             self.fs.conf_set("client_respect_subvolume_snapshot_visibility",
                              "false")
+            # Read and write ciphertext. Do not mint a new fscrypt nonce or
+            # alternate_name; cptree copies those from the source inode.
             self.fs.conf_set("client_fscrypt_as", "false")
+            self.fs.conf_set("client_alternate_name_visible", "true")
             logger.debug("CephFS initializing...")
             self.fs.init()
             logger.debug("CephFS mounting...")
@@ -858,6 +861,7 @@ def get_time_series_rates(data: List[Tuple[float, float]]) -> List[Tuple[float, 
     [(1, 2.0)]
     >>> get_time_series_rates([[1, 1], [2, 3], [4, 11], [5, 16], [6, 22]])
     [(2, 2.0), (4, 4.0), (5, 5.0), (6, 6.0)]
+    >>> del logger.debug
     """
     data = _filter_time_series(data)
     if not data:
@@ -911,6 +915,7 @@ def _filter_time_series(data: List[Tuple[float, float]]) -> List[Tuple[float, fl
     [[0, 1], [1, 3]]
     >>> _filter_time_series([[1, 1], [2, 3], [4, 11], [5, 16], [6, 22]])
     [[1, 1], [2, 3], [4, 11], [5, 16], [6, 22]]
+    >>> del logger.debug
     """
     filtered = []
     for i in range(len(data) - 1):

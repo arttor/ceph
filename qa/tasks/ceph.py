@@ -206,6 +206,12 @@ def ceph_log(ctx, config):
                             err = p.stderr.getvalue()
                             if 'error: error renaming temp state file' in err:
                                 log.info('ignoring transient state error: %s', e)
+                            elif 'is already locked' in err:
+                                # The distro's daily logrotate run holds the
+                                # state file lock. It rotates our logs too (it
+                                # includes /etc/logrotate.d), so skip this
+                                # round instead of failing the job.
+                                log.info('ignoring concurrent logrotate: %s', e)
                             else:
                                 raise
                 except socket.error as e:
@@ -358,7 +364,6 @@ def crush_setup(ctx, config):
         args=['sudo', 'ceph', '--cluster', cluster_name,
               'osd', 'crush', 'tunables', profile])
     yield
-
 
 @contextlib.contextmanager
 def module_setup(ctx, config):
@@ -584,11 +589,24 @@ def ceph_clients(ctx, config):
 
 @contextlib.contextmanager
 def watchdog_setup(ctx, config):
-    ctx.ceph[config['cluster']].thrashers = []
-    ctx.ceph[config['cluster']].watched_processes = []
-    ctx.ceph[config['cluster']].watchdog = DaemonWatchdog(ctx, config)
-    ctx.ceph[config['cluster']].watchdog.start()
-    yield
+    cluster = config['cluster']
+    thrashers = []
+    ctx.ceph[cluster].thrashers = thrashers
+    ctx.ceph[cluster].watched_processes = []
+    watchdog = DaemonWatchdog(ctx, config)
+    ctx.ceph[cluster].watchdog = watchdog
+    watchdog.start()
+    try:
+        yield
+    finally:
+        log.info("Tearing down thrashers...")
+        for thrasher in thrashers:
+            thrasher.stop()
+        for thrasher in thrashers:
+            thrasher.join()
+        log.info("Tearing down watchdog...")
+        watchdog.stop()
+        watchdog.join()
 
 def get_mons(roles, ips, cluster_name,
              mon_bind_msgr2=False,
@@ -1145,6 +1163,11 @@ def cluster(ctx, config):
                     remote.sh(create_log_cmd)
                 remote.run(args=args)
             except run.CommandFailedError:
+                if is_crimson(config):
+                    # every crimson OSD accepts --no-mon-config, so the failure
+                    # is real; retrying without the flag would only wait
+                    # forever for monitors that are not up yet
+                    raise
                 # try without --no-mon-config.. this may be an upgrade test
                 remote.run(
                     args=[
@@ -2236,6 +2259,7 @@ def task(ctx, config):
             mon_bind_addrvec=config.get('mon_bind_addrvec', True),
             cephx=config.get('cephx', {}),
             monmaptool_extra_args=config.get('monmaptool_extra_args', {}),
+            crimson_compat=config.get('crimson_compat', False),
         )),
         lambda: run_daemon(ctx=ctx, config=config, type_='mon'),
         lambda: module_setup(ctx=ctx, config=config),

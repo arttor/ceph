@@ -41,6 +41,9 @@
 #include "rgw_rest_s3control.h"
 #include "rgw_rest_s3website.h"
 #include "rgw_rest_pubsub.h"
+#ifdef WITH_RADOSGW_LANCEDB
+#include "rgw_rest_s3vector.h"
+#endif
 #include "rgw_auth_s3.h"
 #include "rgw_acl.h"
 #include "rgw_policy_s3.h"
@@ -76,6 +79,7 @@
 #include "rgw_sts.h"
 #include "rgw_cksum_pipe.h"
 #include "rgw_s3select.h"
+#include "rgw_cuobj.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
@@ -196,6 +200,14 @@ int get_encryption_defaults(req_state *s)
     }
   }
   if (meta_sse_group & SSE_C_GROUP) {
+    /*
+     * checked here so part uploads are covered; they never reach the
+     * encrypt path that gates a new object write
+     */
+    int r = rgw_s3_check_sse_c_blocked(s);
+    if (r < 0) {
+      return r;
+    }
     ldpp_dout(s, 20) << "get_encryption_defaults: no defaults cause sse-c forced"
 	<< dendl;
     return 0;			// sse-c: no defaults here
@@ -336,7 +348,46 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
     }
   }
 
+  if (auto rdma_token = s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN")) {
+    if (!RGWCuObjServer::available()) {
+      // The client asked for an out-of-band transfer that cannot be served
+      // (cuObject library not installed, or init failed). Do not silently
+      // fall back to the HTTP body.
+      ldpp_dout(this, 0) << "rgw_cuobj: ERROR: RDMA token received but cuObject "
+                            "is unavailable" << dendl;
+      return -ERR_INTERNAL_ERROR;
+    }
+    rdma_descriptor = *rdma_token;
+    rdma_active = true;
+  }
+
   return RGWGetObj_ObjStore::get_params(y);
+}
+
+RGWGetObj_ObjStore_S3::~RGWGetObj_ObjStore_S3()
+{
+  if (rdma_buf) {
+    auto* cuobj = RGWCuObjServer::get_instance();
+    if (cuobj) {
+      cuobj->release_buffer(static_cast<RGWCuObjServer::RDMABufEntry*>(rdma_buf));
+    }
+    rdma_buf = nullptr;
+  }
+}
+
+void RGWGetObj_ObjStore_S3::send_response()
+{
+  if (rdma_active && get_data && !sent_header) {
+    // complete() runs after all reads and filters, including manifest GETs
+    // that do not send an explicit EOF callback.
+    rdma_complete = true;
+    bufferlist bl;
+    const int ret = send_response_data(bl, 0, 0);
+    if (ret < 0) {
+      op_ret = ret;
+      send_response_data_error(s->yield);
+    }
+  }
 }
 
 int RGWGetObj_ObjStore_S3::send_response_data_error(optional_yield y)
@@ -398,6 +449,67 @@ static std::string content_encoding_without_aws_chunked(std::string_view value)
 int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
 					      off_t bl_len)
 {
+  if (rdma_active && get_data && !sent_header && !op_ret) {
+    if (!rdma_complete) {
+      // A zero-length callback is not necessarily the end of the operation:
+      // filters and manifest parts may still fail. Defer success to complete().
+      if (bl_len > 0) {
+        if (rdma_buf_offset > total_len ||
+            static_cast<uint64_t>(bl_len) > total_len - rdma_buf_offset) {
+          return -EIO;
+        }
+        auto* cuobj = RGWCuObjServer::get_instance();
+        if (!cuobj) {
+          return -EIO;
+        }
+        if (!rdma_buf) {
+          // A range only needs space for the response, not the whole object.
+          rdma_buf = cuobj->acquire_buffer(total_len);
+          if (!rdma_buf) {
+            return -EBUSY;
+          }
+        }
+        auto* entry = static_cast<RGWCuObjServer::RDMABufEntry*>(rdma_buf);
+        if (rdma_buf_offset > entry->size ||
+            static_cast<uint64_t>(bl_len) > entry->size - rdma_buf_offset) {
+          return -EIO;
+        }
+        bl.begin(bl_ofs).copy(bl_len,
+            static_cast<char*>(entry->ptr) + rdma_buf_offset);
+        rdma_buf_offset += bl_len;
+      }
+      return 0;
+    }
+
+    if (rdma_buf_offset != total_len) {
+      return -EIO;
+    }
+    if (rdma_buf) {
+      auto* cuobj = RGWCuObjServer::get_instance();
+      if (!cuobj) {
+        return -EIO;
+      }
+      auto* entry = static_cast<RGWCuObjServer::RDMABufEntry*>(rdma_buf);
+      const ssize_t ret = cuobj->rdma_write_to_client(
+          s->object->get_name(), entry, 0, rdma_buf_offset, rdma_descriptor);
+      cuobj->release_buffer(entry);
+      rdma_buf = nullptr;
+      if (ret < 0) {
+        ldpp_dout(this, 0) << "rgw_cuobj: ERROR: failed to write to client via RDMA: "
+                          << cpp_strerror(ret) << dendl;
+        return ret;
+      }
+      s->rdma_bytes_transferred = ret;
+      if (static_cast<size_t>(ret) != rdma_buf_offset) {
+        ldpp_dout(this, 0) << "rgw_cuobj: ERROR: short RDMA write: " << ret
+                          << " of " << rdma_buf_offset << " bytes" << dendl;
+        return -EIO;
+      }
+    }
+    // The synchronous RDMA write has completed. Only now may HTTP success
+    // allow the client to consume or reuse its registered buffer.
+  }
+
   const char *content_type = NULL;
   string content_type_str;
   map<string, string> response_attrs;
@@ -499,7 +611,15 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
   for (auto &it : crypt_http_responses)
     dump_header(s, it.first, it.second);
 
-  dump_content_length(s, total_len);
+  if (rdma_active && get_data) {
+    dump_content_length(s, 0);
+    // Match the HTTP status for ordinary and ranged GET responses.
+    dump_header(s, "x-amz-rdma-reply",
+                (partial_content && !custom_http_ret) ? "206" : "200");
+    dump_header(s, "x-amz-rdma-bytes-transferred", s->rdma_bytes_transferred);
+  } else {
+    dump_content_length(s, total_len);
+  }
   dump_last_modified(s, lastmod);
   dump_header_if_nonempty(s, "x-amz-version-id", version_id);
   dump_header_if_nonempty(s, "x-amz-expiration", expires);  
@@ -785,6 +905,9 @@ done:
 
 send_data:
   if (get_data && !op_ret) {
+    if (rdma_active) {
+      return 0;
+    }
     int r = dump_body(s, bl.c_str() + bl_ofs, bl_len);
     if (r < 0)
       return r;
@@ -2829,12 +2952,10 @@ void RGWCreateBucket_ObjStore_S3::send_response()
     set_req_state_err(s, op_ret);
   }
   dump_errno(s);
-  end_header(s, this);
 
-  if (op_ret < 0)
-    return;
-
-  if (s->system_request) {
+  if (op_ret == 0 && s->system_request) {
+    s->format = RGWFormat::JSON;
+    end_header(s, this, to_mime_type(s->format));
     JSONFormatter f; /* use json formatter for system requests output */
 
     const RGWBucketInfo& info = s->bucket->get_info();
@@ -2845,7 +2966,9 @@ void RGWCreateBucket_ObjStore_S3::send_response()
     encode_json("bucket_info", info, &f);
     f.close_section();
     rgw_flush_formatter_and_reset(s, &f);
+    return;
   }
+  end_header(s, this);
 }
 
 void RGWDeleteBucket_ObjStore_S3::send_response()
@@ -2877,6 +3000,15 @@ static inline void map_qs_metadata(req_state* s, bool crypto_too)
 
 int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
 {
+  if (s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN")) {
+    if (!RGWCuObjServer::available()) {
+      ldpp_dout(this, 0) << "rgw_cuobj: ERROR: RDMA token received but cuObject "
+                            "is unavailable" << dendl;
+      return -ERR_INTERNAL_ERROR;
+    }
+    rdma_active = true;
+  }
+
   if (!s->length) {
     const char *encoding = s->info.env->get("HTTP_TRANSFER_ENCODING");
     if (!encoding || strcmp(encoding, "chunked") != 0) {
@@ -3033,6 +3165,10 @@ void RGWPutObj_ObjStore_S3::send_response()
       dump_errno(s);
       dump_etag(s, etag);
       dump_content_length(s, 0);
+      if (rdma_active) {
+        dump_header(s, "x-amz-rdma-reply", "200");
+        dump_header(s, "x-amz-rdma-bytes-transferred", s->obj_size);
+      }
       dump_header_if_nonempty(s, "x-amz-version-id", version_id);
       dump_header_if_nonempty(s, "x-amz-expiration", expires);
       if (cksum && cksum->aws()) {
@@ -4822,31 +4958,32 @@ int RGWCompleteMultipart_ObjStore_S3::get_params(optional_yield y)
 
   map_qs_metadata(s, true);
 
-  // get encrypt headers to reflect from multipart upload
-  // mostly to verify sse-c here
-  std::unique_ptr<rgw::sal::MultipartUpload> upload =
-    s->bucket->get_multipart_upload(s->object->get_name(),
-        upload_id);
-  std::unique_ptr<rgw::sal::Object> obj = upload->get_meta_obj();
-  obj->set_in_extra_data(true);
-  int res = obj->get_obj_attrs(s->yield, this);
-  if (res < 0 && res != -ENOENT) {
-    ldpp_dout(this, 0) << "ERROR: " << __func__ << " failed to get object attrs for "
-                      << s->object->get_name() << ": " << cpp_strerror(res) << dendl;
-    return res;
-  }
+  return do_aws4_auth_completion();
+}
 
-  // if we found attrs, populate crypt_http_responses
-  if (res == 0) {
-    static constexpr bool copy_source = false;
-    res = rgw_s3_prepare_decrypt(s, s->yield, obj->get_attrs(),
-                                nullptr, &crypt_http_responses, copy_source);
+int RGWCompleteMultipart_ObjStore_S3::verify_encryption(map<string, bufferlist>& attrs,
+                                                        rgw::cksum::Type cksum_type)
+{
+  // s3 only needs the sse-c key here for checksummed uploads; verify it whenever it's sent
+  const std::string stored_mode = get_str_attribute(attrs, RGW_ATTR_CRYPT_MODE);
+  if (stored_mode.starts_with("SSE-C")) {
+    /*
+     * an sse-c multipart upload may have started before the bucket
+     * blocked sse-c; refuse to complete it
+     */
+    int res = rgw_s3_check_sse_c_blocked(s);
     if (res < 0) {
       return res;
     }
   }
-
-  return do_aws4_auth_completion();
+  if (stored_mode.starts_with("SSE-C") &&
+      cksum_type == rgw::cksum::Type::none &&
+      !s->info.env->exists_prefix("HTTP_X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_")) {
+    return 0;
+  }
+  static constexpr bool copy_source = false;
+  return rgw_s3_prepare_decrypt(s, s->yield, attrs, nullptr,
+                                &crypt_http_responses, copy_source);
 }
 
 void RGWCompleteMultipart_ObjStore_S3::send_response()
@@ -6076,14 +6213,37 @@ void parse_post_action(const std::string& post_body, req_state* s)
   }
 }
 
+#ifdef WITH_RADOSGW_LANCEDB
+// s3vector requests looks like bucket POST operations
+// where the "bucket name" is the operation name.
+// with JSON payload
+// and no user provided params
+// POST /<op name> HTTP/1.1
+// Content-type: application/json
+bool is_s3vector_op(const req_state* s) {
+  const auto content_type = s->info.env->get_optional("CONTENT_TYPE");
+  const auto& params = s->info.args.get_params();
+  return std::string_view(s->info.method) == "POST" &&
+    std::count_if(params.begin(), params.end(), [](const auto& p) {
+        return !p.first.starts_with(RGW_SYS_PARAM_PREFIX);
+    }) == 0 &&
+    content_type &&
+    *content_type == "application/json";
+}
+#endif // WITH_RADOSGW_LANCEDB
+
 RGWRESTMgr_S3::RGWRESTMgr_S3(bool enable_s3control,
                              bool _enable_s3website,
                              bool _enable_sts,
                              bool _enable_iam,
-                             bool _enable_pubsub)
+                             bool _enable_pubsub,
+                             bool _enable_s3vector)
   : enable_sts(_enable_sts),
     enable_iam(_enable_iam),
     enable_pubsub(_enable_pubsub)
+#ifdef WITH_RADOSGW_LANCEDB
+    , enable_s3vector(_enable_s3vector)
+#endif
 {
   if (enable_s3control) {
     s3control = std::make_unique<RGWRESTMgr_S3Control>();
@@ -6177,6 +6337,13 @@ RGWHandler_REST* RGWRESTMgr_S3::get_handler(rgw::sal::Driver* driver,
     return nullptr;
   }
   // has bucket
+#ifdef WITH_RADOSGW_LANCEDB
+  if (enable_s3vector && is_s3vector_op(s)) {
+    ldpp_dout(s, 20) << "INFO: s3vector op: " << s->init_state.url_bucket << dendl;
+    // the payload is read when the handler is initialized
+    return new RGWHandler_REST_s3Vector(auth_registry);
+  }
+#endif // WITH_RADOSGW_LANCEDB
   return new RGWHandler_REST_Bucket_S3(auth_registry, enable_pubsub);
 }
 
@@ -6841,6 +7008,22 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
         case RGW_OP_GET_BUCKET_LOGGING: 
         case RGW_OP_PUT_BUCKET_OWNERSHIP_CONTROLS:
         case RGW_OP_PUT_PUBLIC_ACCESS_BLOCK:
+        case RGW_OP_S3VECTOR_CREATE_INDEX:
+        case RGW_OP_S3VECTOR_CREATE_VECTOR_BUCKET:
+        case RGW_OP_S3VECTOR_DELETE_INDEX:
+        case RGW_OP_S3VECTOR_DELETE_VECTOR_BUCKET:
+        case RGW_OP_S3VECTOR_DELETE_VECTOR_BUCKET_POLICY:
+        case RGW_OP_S3VECTOR_DELETE_VECTORS:
+        case RGW_OP_S3VECTOR_GET_INDEX:
+        case RGW_OP_S3VECTOR_GET_VECTOR_BUCKET:
+        case RGW_OP_S3VECTOR_GET_VECTOR_BUCKET_POLICY:
+        case RGW_OP_S3VECTOR_GET_VECTORS:
+        case RGW_OP_S3VECTOR_LIST_INDEXES:
+        case RGW_OP_S3VECTOR_LIST_VECTOR_BUCKETS:
+        case RGW_OP_S3VECTOR_LIST_VECTORS:
+        case RGW_OP_S3VECTOR_PUT_VECTOR_BUCKET_POLICY:
+        case RGW_OP_S3VECTOR_PUT_VECTORS:
+        case RGW_OP_S3VECTOR_QUERY_VECTORS:
           break;
         default:
           ldpp_dout(s, 10) << "ERROR: AWS4 completion for operation: " << s->op_type << ", NOT IMPLEMENTED" << dendl;

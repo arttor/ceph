@@ -23,6 +23,7 @@
 #include "CInode.h"
 #include "Mutation.h"
 
+#include "MDSContext.h"
 #include "MDSMap.h"
 #include "MDSRank.h"
 #include "MDCache.h"
@@ -32,6 +33,8 @@
 #include "MDBalancer.h"
 #include "SnapClient.h"
 #include "SnapRealm.h"
+#include "cephfs_features.h" // for CEPHFS_FEATURE_REPLY_ENCODING
+
 #include "events/EMetaBlob.h"
 
 #include "common/bloom_filter.hpp"
@@ -1917,7 +1920,12 @@ CDentry *CDir::_load_dentry(
 
       // link to inode?
       CInode *in = mdcache->get_inode(ino);   // we may or may not have it.
-      if (in) {
+      if (in && in->state_test(CInode::STATE_PURGING)) {
+        // Nothing may take a new reference on a purging inode. Leave the
+        // dentry unlinked, as if we did not have the inode in cache.
+        dout(10) << "_fetched  got remote link " << ino << " to purging " << *in
+                 << ", not linking" << dendl;
+      } else if (in) {
         dn->link_remote(dn->get_linkage(), in);
         dout(12) << "_fetched  got remote link " << ino << " which we have " << *in << dendl;
       } else {
@@ -2112,7 +2120,9 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
     dout(10) << " snap_purged_thru " << fnode->snap_purged_thru
 	     << " < " << realm->get_last_destroyed()
 	     << ", snap purge based on " << *snaps << dendl;
-    if (get_num_snap_items() == 0) {
+    // a partial fetch should not advance the marker otherwise a later
+    // fetch will skip the stale check for snap dentries it never saw.
+    if (complete && get_num_snap_items() == 0) {
       const_cast<snapid_t&>(fnode->snap_purged_thru) = realm->get_last_destroyed();
       force_dirty = true;
     }
@@ -2331,7 +2341,7 @@ void CDir::go_bad(bool complete)
     if (get_version() == 0) {
       auto _fnode = allocate_fnode();
       _fnode->version = 1;
-      reset_fnode(std::move(_fnode));
+      set_fresh_fnode(std::move(_fnode));
     }
     
     state_set(STATE_BADFRAG);
@@ -2340,7 +2350,15 @@ void CDir::go_bad(bool complete)
 
   state_clear(STATE_FETCHING);
   auth_unpin(this);
-  finish_waiting(WAIT_COMPLETE, -EIO);
+  /*
+   * fetch_keys() parks its completion contexts in waiting_on_dentry
+   * rather than in the IO callback chain.  If the dirfrag object is
+   * missing/corrupt, complete them with -EIO too, otherwise callers
+   * such as MDCache::open_ino_traverse_dir() wait forever and (during
+   * rejoin) OpenFileTable::_prefetch_inodes() never finishes,
+   * wedging the MDS in up:rejoin.
+   */
+  finish_waiting(WAIT_COMPLETE | WAIT_DENTRY, -EIO);
 }
 
 // -----------------------
